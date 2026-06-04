@@ -27,11 +27,8 @@ ERROR_MARKERS = [
 
 # ---------------- Auth Google Sheets ----------------
 def get_client():
-    raw = (os.environ.get("GCP_SA_JSON") or os.environ.get("GCP_SA_BASE64") or "").strip()
-    if raw.startswith("{"):
-        info = json.loads(raw)                                  # JSON directo
-    else:
-        info = json.loads(base64.b64decode(raw).decode("utf-8"))  # base64 (respaldo)
+    raw = base64.b64decode(os.environ["GCP_SA_BASE64"]).decode("utf-8")
+    info = json.loads(raw)
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
