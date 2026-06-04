@@ -17,6 +17,8 @@ WORKSHEET   = os.environ.get("WORKSHEET", "Errores")
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "30"))   # peticiones en paralelo
 TIMEOUT     = int(os.environ.get("TIMEOUT", "20"))       # segundos por link
 READ_BYTES  = int(os.environ.get("READ_BYTES", "200000"))  # cuánto HTML leer para buscar el marcador
+LIMIT       = int(os.environ.get("LIMIT", "0"))          # 0 = todos; >0 = solo los primeros N (modo prueba)
+DEBUG       = os.environ.get("DEBUG", "0") == "1"        # 1 = imprime cada link y NO escribe al Sheet
 
 # Textos que indican "producto no encontrado" (separa varios con | )
 ERROR_MARKERS = [
@@ -27,8 +29,11 @@ ERROR_MARKERS = [
 
 # ---------------- Auth Google Sheets ----------------
 def get_client():
-    raw = base64.b64decode(os.environ["GCP_SA_BASE64"]).decode("utf-8")
-    info = json.loads(raw)
+    raw = (os.environ.get("GCP_SA_JSON") or os.environ.get("GCP_SA_BASE64") or "").strip()
+    if raw.startswith("{"):
+        info = json.loads(raw)                                    # JSON directo
+    else:
+        info = json.loads(base64.b64decode(raw).decode("utf-8"))  # base64 (respaldo)
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
@@ -73,6 +78,8 @@ async def check_one(session, sem, item):
                 chunk = await r.content.read(READ_BYTES)
                 body = chunk.decode("utf-8", errors="ignore").lower()
                 soft404 = any(m in body for m in ERROR_MARKERS)
+                if DEBUG:
+                    print(f"[{status}] marcador={soft404} bytes={len(chunk)} {url[:90]}")
                 if status >= 400 or soft404:
                     motivo = f"HTTP {status}" if status >= 400 else "Producto no encontrado"
                     return [pid, title, url, str(status), motivo]
@@ -102,11 +109,20 @@ def write_sheet(results):
 
 # ---------------- Main ----------------
 async def main():
-    headers = {"User-Agent": "JuntozFeedChecker/1.0 (revision de links del feed)"}
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
+    }
     connector = aiohttp.TCPConnector(limit=CONCURRENCY, ttl_dns_cache=300)
     async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
         rows = await download_feed(session)
         print(f"Filas en el feed: {len(rows)}")
+        if LIMIT > 0:
+            rows = rows[:LIMIT]
+            print(f"MODO PRUEBA: revisando solo los primeros {len(rows)} links")
 
         sem = asyncio.Semaphore(CONCURRENCY)
         tasks = [asyncio.create_task(check_one(session, sem, item)) for item in rows]
@@ -120,9 +136,12 @@ async def main():
             if res:
                 results.append(res)
 
-    print(f"Links con problema: {len(results)}")
-    write_sheet(results)
-    print("Listo, escrito en el Sheet.")
+    print(f"Links con problema: {len(results)} de {len(rows)}")
+    if DEBUG:
+        print("MODO DEBUG: no se escribe al Sheet.")
+    else:
+        write_sheet(results)
+        print("Listo, escrito en el Sheet.")
 
 if __name__ == "__main__":
     asyncio.run(main())

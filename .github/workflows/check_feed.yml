@@ -24,7 +24,9 @@ jobs:
         env:
           FEED_URL:      ${{ secrets.FEED_URL }}
           SHEET_ID:      ${{ secrets.SHEET_ID }}
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          GCP_SA_JSON:   ${{ secrets.GCP_SA_JSON }}
           CONCURRENCY:   "30"
           ERROR_MARKERS: "producto no encontrado"
+          LIMIT:         "30"
+          DEBUG:         "1"
         run: python check_feed.py
