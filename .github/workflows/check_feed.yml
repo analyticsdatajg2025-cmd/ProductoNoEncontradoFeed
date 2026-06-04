@@ -25,8 +25,6 @@ jobs:
           FEED_URL:      ${{ secrets.FEED_URL }}
           SHEET_ID:      ${{ secrets.SHEET_ID }}
           GCP_SA_JSON:   ${{ secrets.GCP_SA_JSON }}
-          CONCURRENCY:   "10"
           ERROR_MARKERS: "producto no encontrado"
-          LIMIT: "300"
-          DEBUG: "1"
+          LIMIT:         "1000"
         run: python check_feed.py

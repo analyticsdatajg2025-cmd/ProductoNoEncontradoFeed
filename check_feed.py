@@ -14,16 +14,19 @@ from google.oauth2.service_account import Credentials
 # ---------------- Config (vía variables de entorno / secrets) ----------------
 FEED_URL      = os.environ["FEED_URL"]
 SHEET_ID      = os.environ["SHEET_ID"]
-WS_ERRORES    = os.environ.get("WORKSHEET", "Errores")        # productos rotos confirmados
-WS_SIN_IMAGEN = os.environ.get("WORKSHEET_IMG", "SinImagen")  # image_link vacío (solo lee el feed)
-WS_NO_VERIF   = os.environ.get("WORKSHEET_NV", "NoVerificado") # 429/timeout tras reintentos
+WS_ERRORES    = os.environ.get("WORKSHEET", "Errores")         # productos rotos confirmados
+WS_SIN_IMAGEN = os.environ.get("WORKSHEET_IMG", "SinImagen")   # image_link vacío (solo lee el feed)
+WS_NO_VERIF   = os.environ.get("WORKSHEET_NV", "NoVerificado") # 429/timeout tras 2 pasadas
 
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "10"))    # peticiones en paralelo (OJO: 30 gatilla rate-limit)
-TIMEOUT     = int(os.environ.get("TIMEOUT", "25"))        # segundos por link
-READ_BYTES  = int(os.environ.get("READ_BYTES", "60000"))  # cuánto HTML leer para buscar el marcador
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "4"))     # reintentos ante 429 / timeout
-LIMIT       = int(os.environ.get("LIMIT", "0"))           # 0 = todos; >0 = solo los primeros N (modo prueba)
-DEBUG       = os.environ.get("DEBUG", "0") == "1"         # 1 = imprime cada link y NO escribe al Sheet
+CONCURRENCY    = int(os.environ.get("CONCURRENCY", "10"))     # 1ra pasada (rápida)
+CONCURRENCY_2  = int(os.environ.get("CONCURRENCY_2", "3"))    # 2da pasada (gentil, limpia 429)
+COOLDOWN       = int(os.environ.get("COOLDOWN", "45"))        # seg de pausa antes de la 2da pasada
+TIMEOUT        = int(os.environ.get("TIMEOUT", "25"))         # seg por link
+READ_BYTES     = int(os.environ.get("READ_BYTES", "60000"))  # cuánto HTML leer para buscar el marcador
+MAX_RETRIES    = int(os.environ.get("MAX_RETRIES", "4"))      # reintentos por link en la 1ra pasada
+MAX_RETRIES_2  = int(os.environ.get("MAX_RETRIES_2", "6"))    # reintentos por link en la 2da pasada
+LIMIT          = int(os.environ.get("LIMIT", "0"))           # 0 = todos; >0 = solo los primeros N (prueba)
+DEBUG          = os.environ.get("DEBUG", "0") == "1"         # 1 = imprime cada link y NO escribe al Sheet
 
 # Textos que indican "producto no encontrado" (separa varios con | )
 ERROR_MARKERS = [
@@ -45,7 +48,6 @@ def get_client():
 
 # ---------------- Descargar y parsear el feed ----------------
 async def download_feed(session):
-    # timeout largo y propio: el feed pesa 70MB+
     async with session.get(FEED_URL, timeout=aiohttp.ClientTimeout(total=300)) as r:
         r.raise_for_status()
         data = await r.text()
@@ -66,11 +68,7 @@ async def download_feed(session):
     for row in reader:
         if not row:
             continue
-        pid   = safe(row, i_id)
-        title = safe(row, i_title)
-        link  = safe(row, i_link)
-        img   = safe(row, i_img)
-        # Chequeo de imagen: directo del feed, sin HTTP. Es confiable al 100%.
+        pid, title, link, img = safe(row, i_id), safe(row, i_title), safe(row, i_link), safe(row, i_img)
         if i_img is not None and not img:
             sin_imagen.append([pid, title, link])
         rows.append((pid, title, link))
@@ -78,7 +76,6 @@ async def download_feed(session):
 
 # ---------------- Helper: cuánto esperar ante un 429 ----------------
 def calc_espera(retry_after, intento):
-    # Respeta el header Retry-After si viene; si no, backoff exponencial con jitter.
     if retry_after:
         try:
             return min(float(retry_after), 30)
@@ -87,54 +84,57 @@ def calc_espera(retry_after, intento):
     return min((2 ** intento) + random.random(), 30)
 
 # ---------------- Chequear un link (con reintentos) ----------------
-async def check_one(session, sem, item):
+async def check_one(session, sem, item, max_retries):
     pid, title, url = item
     if not url:
         return None
     async with sem:
-        for intento in range(MAX_RETRIES + 1):
+        for intento in range(max_retries + 1):
             try:
                 async with session.get(
-                    url,
-                    allow_redirects=True,
+                    url, allow_redirects=True,
                     timeout=aiohttp.ClientTimeout(total=TIMEOUT),
                 ) as r:
                     status = r.status
 
-                    # --- 429: NO es un error de producto. Reintentar con pausa. ---
-                    if status == 429:
-                        if intento < MAX_RETRIES:
+                    if status == 429:  # rate-limit: NO es error de producto, reintentar
+                        if intento < max_retries:
                             await asyncio.sleep(calc_espera(r.headers.get("Retry-After"), intento))
                             continue
-                        # Tras agotar reintentos seguimos bloqueados -> no verificado, NO error.
-                        if DEBUG:
-                            print(f"[429] no verificado tras {MAX_RETRIES} reintentos {url[:90]}")
                         return ("nv", [pid, title, url, "429", "No verificado (rate limit)"])
 
-                    # --- Error duro de HTTP (404, 410, 500...): producto roto ---
-                    if status >= 400:
-                        if DEBUG:
-                            print(f"[{status}] ERROR {url[:90]}")
+                    if status >= 400:  # 404/410/500: producto roto
                         return ("err", [pid, title, url, str(status), f"HTTP {status}"])
 
-                    # --- 200/3xx: revisar soft-404 leyendo el cuerpo ---
                     chunk = await r.content.read(READ_BYTES)
                     body = chunk.decode("utf-8", errors="ignore").lower()
-                    soft404 = any(m in body for m in ERROR_MARKERS)
-                    if DEBUG:
-                        print(f"[{status}] marcador={soft404} bytes={len(chunk)} {url[:90]}")
-                    if soft404:
+                    if any(m in body for m in ERROR_MARKERS):
                         return ("err", [pid, title, url, str(status), "Producto no encontrado"])
-                    return None  # OK, todo bien
+                    return None  # OK
 
             except asyncio.TimeoutError:
-                if intento < MAX_RETRIES:
+                if intento < max_retries:
                     await asyncio.sleep(calc_espera(None, intento))
                     continue
                 return ("nv", [pid, title, url, "TIMEOUT", "No verificado (no respondió)"])
             except Exception as e:
                 return ("nv", [pid, title, url, "ERROR", str(e)[:120]])
     return None
+
+# ---------------- Correr una tanda de links ----------------
+async def correr_tanda(session, items, concurrencia, max_retries, etiqueta):
+    sem = asyncio.Semaphore(concurrencia)
+    tasks = [asyncio.create_task(check_one(session, sem, it, max_retries)) for it in items]
+    errores, no_verif, done = [], [], 0
+    for coro in asyncio.as_completed(tasks):
+        res = await coro
+        done += 1
+        if done % 5000 == 0:
+            print(f"  [{etiqueta}] {done}/{len(items)}")
+        if res:
+            tipo, fila = res
+            (errores if tipo == "err" else no_verif).append(fila)
+    return errores, no_verif
 
 # ---------------- Escribir una hoja ----------------
 def escribir_hoja(sh, nombre, header, filas, nota=""):
@@ -164,20 +164,22 @@ async def main():
             rows = rows[:LIMIT]
             print(f"MODO PRUEBA: revisando solo los primeros {len(rows)} links")
 
-        sem = asyncio.Semaphore(CONCURRENCY)
-        tasks = [asyncio.create_task(check_one(session, sem, item)) for item in rows]
+        # 1ra pasada: rápida
+        print(f"Pasada 1 (concurrencia {CONCURRENCY})...")
+        errores, no_verif = await correr_tanda(session, rows, CONCURRENCY, MAX_RETRIES, "p1")
+        print(f"  Pasada 1 -> errores: {len(errores)} | no verificados: {len(no_verif)}")
 
-        errores, no_verif, done = [], [], 0
-        for coro in asyncio.as_completed(tasks):
-            res = await coro
-            done += 1
-            if done % 5000 == 0:
-                print(f"Procesados {done}/{len(rows)}")
-            if res:
-                tipo, fila = res
-                (errores if tipo == "err" else no_verif).append(fila)
+        # 2da pasada: re-chequea SOLO los no verificados, gentil para no gatillar 429
+        if no_verif:
+            print(f"Enfriando {COOLDOWN}s antes de la pasada 2...")
+            await asyncio.sleep(COOLDOWN)
+            reintentar = [(r[0], r[1], r[2]) for r in no_verif]
+            print(f"Pasada 2 (concurrencia {CONCURRENCY_2}) sobre {len(reintentar)} links...")
+            err2, no_verif = await correr_tanda(session, reintentar, CONCURRENCY_2, MAX_RETRIES_2, "p2")
+            errores.extend(err2)
+            print(f"  Pasada 2 -> nuevos errores: {len(err2)} | siguen sin verificar: {len(no_verif)}")
 
-    print(f"Errores reales: {len(errores)} | No verificados: {len(no_verif)} | Sin imagen: {len(sin_imagen)}")
+    print(f"FINAL -> Errores: {len(errores)} | No verificados: {len(no_verif)} | Sin imagen: {len(sin_imagen)}")
 
     if DEBUG:
         print("MODO DEBUG: no se escribe al Sheet.")
@@ -193,7 +195,7 @@ async def main():
     escribir_hoja(sh, WS_SIN_IMAGEN, ["id", "title", "link"], sin_imagen,
                   nota=f"Última ejecución: {ts:%Y-%m-%d %H:%M} (Lima) — {len(sin_imagen)} sin image_link")
     escribir_hoja(sh, WS_NO_VERIF, ["id", "title", "link", "status", "motivo"], no_verif,
-                  nota=f"Última ejecución: {ts:%Y-%m-%d %H:%M} (Lima) — {len(no_verif)} no verificados (revisar si suben mucho)")
+                  nota=f"Última ejecución: {ts:%Y-%m-%d %H:%M} (Lima) — {len(no_verif)} no verificados (si suben mucho, baja CONCURRENCY)")
     print("Listo, escrito en el Sheet (3 hojas).")
 
 if __name__ == "__main__":
