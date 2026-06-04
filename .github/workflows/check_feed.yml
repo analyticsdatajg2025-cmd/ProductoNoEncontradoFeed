@@ -1,0 +1,30 @@
+name: Revisar links del feed Juntoz
+
+on:
+  schedule:
+    - cron: "0 13 * * *"   # 08:00 Lima (UTC-5)
+    - cron: "0 21 * * *"   # 16:00 Lima (UTC-5)
+  workflow_dispatch: {}     # botón para correrlo manualmente
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar checker
+        env:
+          FEED_URL:      ${{ secrets.FEED_URL }}
+          SHEET_ID:      ${{ secrets.SHEET_ID }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          CONCURRENCY:   "30"
+          ERROR_MARKERS: "producto no encontrado"
+        run: python check_feed.py

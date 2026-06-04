@@ -1,0 +1,3 @@
+aiohttp>=3.9
+gspread>=6.0
+google-auth>=2.0
