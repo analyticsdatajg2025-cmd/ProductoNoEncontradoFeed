@@ -4,7 +4,12 @@ on:
   schedule:
     - cron: "0 13 * * *"   # 08:00 Lima (UTC-5)
     - cron: "0 21 * * *"   # 16:00 Lima (UTC-5)
-  workflow_dispatch: {}     # botón para correrlo manualmente
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Límite de productos a revisar (0 = todos). Usar >0 solo para pruebas."
+        required: false
+        default: "0"
 
 jobs:
   check:
@@ -26,5 +31,10 @@ jobs:
           SHEET_ID:      ${{ secrets.SHEET_ID }}
           GCP_SA_JSON:   ${{ secrets.GCP_SA_JSON }}
           ERROR_MARKERS: "producto no encontrado"
-          LIMIT:         "1000"
+          # LIMIT: 0 en producción (procesa el feed completo ~155K filas).
+          # En workflow_dispatch se puede pasar un número para pruebas rápidas.
+          LIMIT: ${{ github.event.inputs.limit || '0' }}
+          CONCURRENCY:   "10"
+          CONCURRENCY_2: "3"
+          COOLDOWN:      "45"
         run: python check_feed.py
