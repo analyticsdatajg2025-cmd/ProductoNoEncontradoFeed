@@ -7,14 +7,33 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "Límite de productos a revisar (0 = todos). Usar >0 solo para pruebas."
+        description: "Límite total de productos (0 = todos). Solo para pruebas."
         required: false
         default: "0"
 
+# ── Cuántos jobs paralelos usar ──────────────────────────────────────────────
+# Con SHARD_TOTAL=10 y ~155K productos → cada job procesa ~15.5K links.
+# Con CONCURRENCY=50 por job, tiempo estimado: 15-25 min en total.
+# Si ves muchos NO_VERIFICADO, baja CONCURRENCY a 30.
+# Si quieres más velocidad, sube SHARD_TOTAL a 15 (máx recomendado para no
+# saturar la API de Sheets con escrituras simultáneas).
+env:
+  SHARD_TOTAL: "10"
+  CONCURRENCY: "50"
+  CONCURRENCY_2: "10"
+  COOLDOWN: "30"
+
 jobs:
-  check:
+
+  # ── JOB 1: N shards en paralelo, cada uno procesa su trozo del feed ────────
+  shard:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false          # si un shard falla, los demás siguen
+      matrix:
+        shard_index: [0,1,2,3,4,5,6,7,8,9]   # debe coincidir con SHARD_TOTAL
+
     steps:
       - uses: actions/checkout@v4
 
@@ -25,16 +44,43 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Ejecutar checker
+      - name: Ejecutar shard ${{ matrix.shard_index }}
         env:
           FEED_URL:      ${{ secrets.FEED_URL }}
           SHEET_ID:      ${{ secrets.SHEET_ID }}
           GCP_SA_JSON:   ${{ secrets.GCP_SA_JSON }}
           ERROR_MARKERS: "producto no encontrado"
-          # LIMIT: 0 en producción (procesa el feed completo ~155K filas).
-          # En workflow_dispatch se puede pasar un número para pruebas rápidas.
-          LIMIT: ${{ github.event.inputs.limit || '0' }}
-          CONCURRENCY:   "10"
-          CONCURRENCY_2: "3"
-          COOLDOWN:      "45"
+          SHARD_INDEX:   ${{ matrix.shard_index }}
+          SHARD_TOTAL:   ${{ env.SHARD_TOTAL }}
+          CONCURRENCY:   ${{ env.CONCURRENCY }}
+          CONCURRENCY_2: ${{ env.CONCURRENCY_2 }}
+          COOLDOWN:      ${{ env.COOLDOWN }}
+          LIMIT:         ${{ github.event.inputs.limit || '0' }}
+          MERGE_JOB:     "0"
+        run: python check_feed.py
+
+  # ── JOB 2: merge — corre DESPUÉS de que todos los shards terminaron ────────
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: shard          # espera a que todos los shards terminen
+    if: always()          # corre aunque algún shard haya fallado (para no perder datos)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Consolidar resultados en Google Sheets
+        env:
+          FEED_URL:    ${{ secrets.FEED_URL }}
+          SHEET_ID:    ${{ secrets.SHEET_ID }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SHARD_TOTAL: ${{ env.SHARD_TOTAL }}
+          MERGE_JOB:   "1"
         run: python check_feed.py
