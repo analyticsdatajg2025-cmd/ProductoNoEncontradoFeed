@@ -64,12 +64,13 @@ SIN_STOCK_MARKERS = ["producto fuera de stock", "agotado"]
 RE_CONTEO = re.compile(r"se encontraron\s*(\d+)\s*productos")
 
 TIPO_ORDEN = {
-    "LINK_ROTO": 1, "SOFT_404": 2, "REDIRECT": 3, "STOCK_DESALINEADO": 4,
+    "BLOQUEADO": 0, "LINK_ROTO": 1, "SOFT_404": 2, "REDIRECT": 3, "STOCK_DESALINEADO": 4,
     "SIN_STOCK": 5, "SIN_IMAGEN": 6, "SIN_PRODUCTOS": 7, "REVISAR": 8,
     "NO_VERIFICADO": 9,
 }
 
 ACCIONES = {
+    "BLOQUEADO":         "El servidor rechazó la petición — NO es un link roto. Coordinar acceso.",
     "LINK_ROTO":         "Revisar URL o dar de baja el producto del feed",
     "SOFT_404":          "Producto inexistente — quitar del feed",
     "REDIRECT":          "La URL redirige a otra página — corregir link en el feed",
@@ -82,7 +83,8 @@ ACCIONES = {
 }
 
 QUE_SIGNIFICA = {
-    "LINK_ROTO":         "HTTP 4xx/5xx — la URL no existe o el servidor rechaza",
+    "BLOQUEADO":         "HTTP 403/401/503 — WAF o rate limit. El producto puede estar sano.",
+    "LINK_ROTO":         "HTTP 404/410 — la URL no existe",
     "SOFT_404":          "Página 'Producto no encontrado' devuelta con HTTP 200",
     "REDIRECT":          "La URL final es distinta a la del feed",
     "STOCK_DESALINEADO": "Feed dice in_stock, la página dice lo contrario",
@@ -106,6 +108,29 @@ HTTP_HEADERS = {
     # y todo cae en NO_VERIFICADO.
     "Accept-Encoding": "gzip, deflate",
 }
+
+
+# ---------------- Circuit breaker ----------------
+# Si el sitio empieza a rechazar todo (WAF, rate limit, IP bloqueada), seguir
+# pidiendo 15K URLs solo genera un reporte falso gigante. Cortamos temprano.
+BLOQUEO_STATUS = {401, 403, 429, 503}
+UMBRAL_BLOQUEO = float(os.environ.get("UMBRAL_BLOQUEO", "0.5"))
+MIN_MUESTRA    = int(os.environ.get("MIN_MUESTRA", "200"))
+
+STATS = {"total": 0, "bloqueados": 0, "muestra_body": "", "muestra_headers": ""}
+ABORTAR = asyncio.Event()
+
+
+def registrar(status, body="", headers=None):
+    STATS["total"] += 1
+    if status in BLOQUEO_STATUS:
+        STATS["bloqueados"] += 1
+        if not STATS["muestra_body"]:
+            STATS["muestra_body"] = body[:800]
+            STATS["muestra_headers"] = str(dict(headers or {}))[:600]
+    if (STATS["total"] >= MIN_MUESTRA
+            and STATS["bloqueados"] / STATS["total"] > UMBRAL_BLOQUEO):
+        ABORTAR.set()
 
 
 # ---------------- Auth ----------------
@@ -233,6 +258,9 @@ async def check_one(session, sem, item, max_retries):
     if not url:
         return None
     base = {"id": pid, "title": title, "link": url, "avail": avail, "url_final": ""}
+    if ABORTAR.is_set():
+        return {**base, "tipo": "BLOQUEADO", "status": "ABORTADO",
+                "motivo": "No verificado: la corrida se detuvo por bloqueo masivo"}
     async with sem:
         for intento in range(max_retries + 1):
             try:
@@ -242,13 +270,19 @@ async def check_one(session, sem, item, max_retries):
                     final = str(r.url)
                     base["url_final"] = final if final != url else ""
 
-                    if status == 429:
+                    if status in BLOQUEO_STATUS:
+                        cuerpo = ""
+                        if not STATS["muestra_body"]:
+                            cuerpo = (await r.content.read(2000)).decode(
+                                "utf-8", errors="ignore")
+                        registrar(status, cuerpo, r.headers)
                         if intento < max_retries:
                             await asyncio.sleep(
                                 calc_espera(r.headers.get("Retry-After"), intento))
                             continue
-                        return {**base, "tipo": "NO_VERIFICADO", "status": "429",
-                                "motivo": "Rate limit — no se pudo verificar"}
+                        return {**base, "tipo": "BLOQUEADO", "status": str(status),
+                                "motivo": f"HTTP {status} — el servidor rechazó la petición"}
+                    registrar(status)
                     if status >= 400:
                         return {**base, "tipo": "LINK_ROTO", "status": str(status),
                                 "motivo": f"HTTP {status}"}
@@ -449,7 +483,21 @@ async def run_shard():
             print(f"  → nuevos: {len(prob2)} | siguen sin verificar: {len(no_verif)}")
 
     todos = problemas + no_verif
-    print(f"Shard {SHARD_INDEX} terminado: {len(todos)} problemas")
+    pct_bloq = STATS["bloqueados"] / STATS["total"] if STATS["total"] else 0
+    print(f"Shard {SHARD_INDEX} terminado: {len(todos)} problemas | "
+          f"bloqueados: {STATS['bloqueados']}/{STATS['total']} ({pct_bloq*100:.1f}%)")
+
+    if ABORTAR.is_set() or pct_bloq > UMBRAL_BLOQUEO:
+        print("\n" + "=" * 70)
+        print("CORRIDA ABORTADA — el sitio está rechazando las peticiones.")
+        print(f"  {pct_bloq*100:.1f}% de las respuestas fueron 401/403/429/503.")
+        print("  Esto NO significa que los links estén rotos.")
+        print(f"\n  Headers de la respuesta bloqueada:\n  {STATS['muestra_headers']}")
+        print(f"\n  Cuerpo (primeros 800 chars):\n{STATS['muestra_body']}")
+        print("=" * 70)
+        raise SystemExit(
+            "Abortado: bloqueo masivo. No se escribe al Sheet para no generar "
+            "un reporte de falsos positivos.")
 
     if DEBUG:
         print("DEBUG: no se escribe al Sheet.")
