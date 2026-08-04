@@ -2,37 +2,46 @@ name: Revisar links del feed Juntoz
 
 on:
   schedule:
-    - cron: "0 13 * * *"   # 08:00 Lima (UTC-5)
-    - cron: "0 21 * * *"   # 16:00 Lima (UTC-5)
+    # 04:00 Lima. Horario de baja carga: son ~155K requests contra juntoz.com,
+    # no conviene lanzarlas a las 08:00 ni a las 16:00 (picos de tráfico real).
+    - cron: "0 9 * * *"
   workflow_dispatch:
     inputs:
       limit:
         description: "Límite total de productos (0 = todos). Solo para pruebas."
         required: false
         default: "0"
+      concurrency_override:
+        description: "CONCURRENCY por shard (vacío = usar el default)"
+        required: false
+        default: ""
 
-# ── Cuántos jobs paralelos usar ──────────────────────────────────────────────
-# Con SHARD_TOTAL=10 y ~155K productos → cada job procesa ~15.5K links.
-# Con CONCURRENCY=50 por job, tiempo estimado: 15-25 min en total.
-# Si ves muchos NO_VERIFICADO, baja CONCURRENCY a 30.
-# Si quieres más velocidad, sube SHARD_TOTAL a 15 (máx recomendado para no
-# saturar la API de Sheets con escrituras simultáneas).
+# Evita que un run manual pise a uno programado: ambos escriben en las mismas
+# hojas _shard_N y se corromperían entre sí.
+concurrency:
+  group: check-feed-juntoz
+  cancel-in-progress: false
+
 env:
   SHARD_TOTAL: "10"
-  CONCURRENCY: "50"
-  CONCURRENCY_2: "10"
+  CONCURRENCY: "25"
+  CONCURRENCY_2: "8"
   COOLDOWN: "30"
 
 jobs:
 
-  # ── JOB 1: N shards en paralelo, cada uno procesa su trozo del feed ────────
+  # ── JOB 1: N shards en paralelo ───────────────────────────────────────────
   shard:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
-      fail-fast: false          # si un shard falla, los demás siguen
+      fail-fast: false
+      max-parallel: 10
       matrix:
-        shard_index: [0,1,2,3,4,5,6,7,8,9]   # debe coincidir con SHARD_TOTAL
+        # OJO: esta lista debe tener exactamente SHARD_TOTAL elementos.
+        # GitHub no permite leer env.SHARD_TOTAL desde strategy, así que
+        # si cambias uno hay que cambiar el otro a mano.
+        shard_index: [0,1,2,3,4,5,6,7,8,9]
 
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +49,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Instalar dependencias
         run: pip install -r requirements.txt
@@ -49,22 +59,26 @@ jobs:
           FEED_URL:      ${{ secrets.FEED_URL }}
           SHEET_ID:      ${{ secrets.SHEET_ID }}
           GCP_SA_JSON:   ${{ secrets.GCP_SA_JSON }}
-          ERROR_MARKERS: "producto no encontrado"
           SHARD_INDEX:   ${{ matrix.shard_index }}
           SHARD_TOTAL:   ${{ env.SHARD_TOTAL }}
-          CONCURRENCY:   ${{ env.CONCURRENCY }}
+          CONCURRENCY:   ${{ github.event.inputs.concurrency_override || env.CONCURRENCY }}
           CONCURRENCY_2: ${{ env.CONCURRENCY_2 }}
           COOLDOWN:      ${{ env.COOLDOWN }}
           LIMIT:         ${{ github.event.inputs.limit || '0' }}
           MERGE_JOB:     "0"
         run: python check_feed.py
 
-  # ── JOB 2: merge — corre DESPUÉS de que todos los shards terminaron ────────
+  # ── JOB 2: merge ──────────────────────────────────────────────────────────
   merge:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: shard          # espera a que todos los shards terminen
-    if: always()          # corre aunque algún shard haya fallado (para no perder datos)
+    needs: shard
+    # Antes: if: always(). Eso corría el merge incluso con los 10 shards caídos,
+    # sobrescribiendo el Reporte con 0 filas — un tablero en verde que en
+    # realidad significa "no se revisó nada".
+    # Con !cancelled() corre si al menos algo terminó; y el script aborta solo
+    # si no encontró ninguna hoja _shard_N.
+    if: ${{ !cancelled() }}
 
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +86,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Instalar dependencias
         run: pip install -r requirements.txt
